@@ -1,0 +1,11 @@
+[env]
+MACOSX_DEPLOYMENT_TARGET = "11.0"
+CMAKE_OSX_DEPLOYMENT_TARGET = "11.0"
+CXXFLAGS = "-mmacosx-version-min=11.0"
+CFLAGS = "-mmacosx-version-min=11.0"
+
+[target.aarch64-apple-darwin]
+runner = "scripts/codesign_runner.sh"
+
+[target.x86_64-apple-darwin]
+runner = "scripts/codesign_runner.sh"

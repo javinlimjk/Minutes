@@ -1,0 +1,40 @@
+[package]
+name = "minutes"
+version = "0.1.0"
+description = "Minutes - 100% Offline Privacy-First Desktop Meeting Transcriber"
+authors = ["Minutes Team"]
+edition = "2021"
+
+[lib]
+name = "minutes_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+cc = "1.0"
+
+[dependencies]
+tauri = { version = "2", features = ["protocol-asset", "devtools"] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+cpal = "0.15"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.8", features = ["v4", "serde"] }
+hound = "3.5.1"
+aes-gcm = "0.10"
+rand = "0.8"
+keyring = "2"
+dirs-next = "2.0"
+futures-util = "0.3"
+
+[target.'cfg(not(target_os = "ios"))'.dependencies]
+whisper-rs = { version = "0.16.0", features = ["metal"] }
+
+
+
+
+
