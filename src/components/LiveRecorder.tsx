@@ -392,98 +392,28 @@ export const LiveRecorder: React.FC<LiveRecorderProps> = ({
         }
 
         if (liveWhisperSegs && liveWhisperSegs.length > 0) {
-          setSegments((prev) => {
-            const updated = [...prev];
-            liveWhisperSegs.forEach((s: any) => {
+          const mapped: TranscriptSegment[] = liveWhisperSegs
+            .filter((s: any) => {
               const text = (s.text || '').trim();
-              if (!text) return;
-
-              // Filter out bracketed hallucination tokens like [Motor], [Music], (Silence)
+              if (!text) return false;
               if ((text.startsWith('[') && text.endsWith(']')) || (text.startsWith('(') && text.endsWith(')'))) {
-                return;
-              }
-
-              const cleanNew = text.toLowerCase().replace(/[^\w\s\u4e00-\u9fff]/g, '');
-              if (cleanNew.length < 2) return;
-
-              const startSecs = Math.round(s.start_timestamp);
-              const endSecs = Math.round(s.end_timestamp);
-
-              // Check if this text or timestamp range overlaps with any existing segment in the list
-              const existingIdx = updated.findIndex((seg) => {
-                const segClean = seg.text.toLowerCase().replace(/[^\w\s\u4e00-\u9fff]/g, '');
-                if (!segClean) return false;
-
-                // Exact or substring match
-                if (segClean === cleanNew || segClean.includes(cleanNew) || cleanNew.includes(segClean)) {
-                  return true;
-                }
-
-                // Check for overlapping timestamp range (within 5 seconds) + prefix/phrase similarity
-                const startDiff = Math.abs(seg.start_time - startSecs);
-                const endDiff = Math.abs(seg.end_time - endSecs);
-                if (startDiff <= 5 || endDiff <= 5) {
-                  const prefix1 = segClean.slice(0, 10);
-                  const prefix2 = cleanNew.slice(0, 10);
-                  if (prefix1 === prefix2 || segClean.startsWith(prefix2) || cleanNew.startsWith(prefix1)) {
-                    return true;
-                  }
-                }
                 return false;
-              });
-
-              if (existingIdx !== -1) {
-                // Update existing segment in-place with latest/longest phrase
-                if (text.length >= updated[existingIdx].text.length) {
-                  updated[existingIdx] = {
-                    ...updated[existingIdx],
-                    start_time: Math.min(updated[existingIdx].start_time, startSecs),
-                    end_time: Math.max(updated[existingIdx].end_time, endSecs),
-                    text: text,
-                  };
-                }
-              } else {
-                // Push new unique segment
-                updated.push({
-                  id: `seg_live_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
-                  meeting_id: 'live',
-                  speaker_label: s.speaker || 'Speaker',
-                  start_time: startSecs,
-                  end_time: endSecs,
-                  text: text,
-                  confidence: 0.95,
-                });
               }
-            });
+              return true;
+            })
+            .map((s: any, idx: number) => ({
+              id: `seg_live_${idx}_${Math.round(s.start_timestamp * 10)}`,
+              meeting_id: 'live',
+              speaker_label: s.speaker || 'Speaker',
+              start_time: Math.round(s.start_timestamp),
+              end_time: Math.round(s.end_timestamp),
+              text: (s.text || '').trim(),
+              confidence: 0.95,
+            }));
 
-            // Always keep segments sorted chronologically by start_time
-            updated.sort((a, b) => a.start_time - b.start_time);
-
-            // Consolidate adjacent continuous segments into unified paragraph cards (if gap <= 5s and same speaker)
-            const consolidated: any[] = [];
-            updated.forEach((seg) => {
-              if (consolidated.length === 0) {
-                consolidated.push({ ...seg });
-                return;
-              }
-              const last = consolidated[consolidated.length - 1];
-              const gap = seg.start_time - last.end_time;
-              const isSameSpeaker = (last.speaker_label || 'Speaker') === (seg.speaker_label || 'Speaker');
-
-              if (isSameSpeaker && gap <= 5 && (last.text.length + seg.text.length) < 600) {
-                const cleanLast = last.text.trim();
-                const cleanSeg = seg.text.trim();
-                if (cleanLast.toLowerCase() !== cleanSeg.toLowerCase() && !cleanLast.toLowerCase().includes(cleanSeg.toLowerCase())) {
-                  last.text = `${cleanLast} ${cleanSeg}`;
-                  last.end_time = Math.max(last.end_time, seg.end_time);
-                }
-              } else {
-                consolidated.push({ ...seg });
-              }
-            });
-
-            return consolidated;
-          });
+          if (mapped.length > 0) {
+            setSegments(mapped);
+          }
         }
       } catch (e) {
         console.warn('Live transcript polling notice:', e);

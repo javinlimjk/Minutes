@@ -6,7 +6,7 @@ interface AudioVisualizerProps {
   audioData?: Uint8Array | null;
 }
 
-export const AudioVisualizer: React.FC<AudioVisualizerProps> = ({ isRecording, isPaused = false, audioData }) => {
+export const AudioVisualizer: React.FC<AudioVisualizerProps> = React.memo(({ isRecording, isPaused = false, audioData }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
   useEffect(() => {
@@ -83,5 +83,5 @@ export const AudioVisualizer: React.FC<AudioVisualizerProps> = ({ isRecording, i
       />
     </div>
   );
-};
+});
 

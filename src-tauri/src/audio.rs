@@ -84,6 +84,7 @@ impl AudioEngine {
                     &config,
                     move |data: &[f32], _: &cpal::InputCallbackInfo| {
                         let mut b = buf.lock().unwrap_or_else(|e| e.into_inner());
+                        b.reserve(data.len() / channels);
                         for chunk in data.chunks(channels) {
                             let mono_sample = chunk.iter().sum::<f32>() / channels as f32;
                             b.push(mono_sample);
@@ -99,6 +100,7 @@ impl AudioEngine {
                     &config,
                     move |data: &[i16], _: &cpal::InputCallbackInfo| {
                         let mut b = buf.lock().unwrap_or_else(|e| e.into_inner());
+                        b.reserve(data.len() / channels);
                         for chunk in data.chunks(channels) {
                             let mono_sample = chunk.iter().map(|&s| s as f32 / 32768.0).sum::<f32>() / channels as f32;
                             b.push(mono_sample);
@@ -114,6 +116,7 @@ impl AudioEngine {
                     &config,
                     move |data: &[u16], _: &cpal::InputCallbackInfo| {
                         let mut b = buf.lock().unwrap_or_else(|e| e.into_inner());
+                        b.reserve(data.len() / channels);
                         for chunk in data.chunks(channels) {
                             let mono_sample = chunk.iter().map(|&s| (s as f32 - 32768.0) / 32768.0).sum::<f32>() / channels as f32;
                             b.push(mono_sample);

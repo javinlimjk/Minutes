@@ -480,27 +480,32 @@ pub async fn resolve_clinical_roles(
         }
     }
 
-    // 4. Fallback Rule-Based Turn-Flow Classifier for any unmapped segments
+    // 4. Fallback and Clinical Rule Alignment
     let mut current_role = "Doctor".to_string();
 
     for i in 0..segments.len() {
+        let text = &segments[i].text;
+        let is_doc = is_doctor_utterance(text);
+        let is_pat = is_patient_utterance(text);
+
+        if is_pat && !is_doc {
+            segments[i].speaker_label = "Patient".to_string();
+            current_role = "Patient".to_string();
+            continue;
+        } else if is_doc && !is_pat {
+            segments[i].speaker_label = "Doctor".to_string();
+            current_role = "Doctor".to_string();
+            continue;
+        }
+
         if line_mapping.contains_key(&i) {
             current_role = segments[i].speaker_label.clone();
             continue;
         }
 
-        let text = &segments[i].text;
-        let is_doc = is_doctor_utterance(text);
-        let is_pat = is_patient_utterance(text);
-
-        if is_doc && !is_pat {
-            current_role = "Doctor".to_string();
-        } else if is_pat && !is_doc {
-            current_role = "Patient".to_string();
-        } else if i > 0 {
+        if i > 0 {
             let prev_text = &segments[i - 1].text;
             let prev_role = &segments[i - 1].speaker_label;
-            // If previous was a Doctor question, this response is the Patient
             if prev_role == "Doctor" && (prev_text.ends_with('?') || prev_text.contains('?') || is_doctor_utterance(prev_text)) {
                 current_role = "Patient".to_string();
             }

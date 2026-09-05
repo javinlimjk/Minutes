@@ -20,10 +20,17 @@ use soap::SOAPNote;
 use chrono::Utc;
 use uuid::Uuid;
 
+#[derive(Default)]
+pub struct LiveTranscriptionState {
+    pub confirmed_segments: Vec<stt::WhisperSegment>,
+    pub confirmed_sample_offset: usize,
+}
+
 pub struct AppState {
     pub db: Arc<Mutex<Connection>>,
     pub audio_engine: Arc<Mutex<audio::AudioEngine>>,
     pub stt_engine: Arc<Mutex<Option<stt::WhisperEngine>>>,
+    pub live_state: Arc<Mutex<LiveTranscriptionState>>,
 }
 
 #[tauri::command]
@@ -71,6 +78,11 @@ fn start_recording(state: State<'_, AppState>, title: String, specialty: Option<
 
     db::insert_meeting(&conn, &new_meeting).map_err(|e| e.to_string())?;
 
+    if let Ok(mut live) = state.live_state.lock() {
+        live.confirmed_segments.clear();
+        live.confirmed_sample_offset = 0;
+    }
+
     if let Ok(mut audio) = state.audio_engine.lock() {
         if let Err(e) = audio.start_capture() {
             eprintln!("[start_recording] Audio capture notice: {}", e);
@@ -82,48 +94,147 @@ fn start_recording(state: State<'_, AppState>, title: String, specialty: Option<
 
 #[tauri::command]
 fn start_audio_capture(state: State<'_, AppState>) -> Result<(), String> {
+    if let Ok(mut live) = state.live_state.lock() {
+        live.confirmed_segments.clear();
+        live.confirmed_sample_offset = 0;
+    }
     let mut audio = state.audio_engine.lock().map_err(|e| e.to_string())?;
     audio.start_capture().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 fn get_live_transcript(state: State<'_, AppState>) -> Result<Vec<stt::WhisperSegment>, String> {
-    let (pcm_chunk, total_duration) = {
+    let mut live = state.live_state.lock().map_err(|e| e.to_string())?;
+    let offset_16k = live.confirmed_sample_offset;
+
+    let (active_pcm, total_16k_samples, slice_offset_16k) = {
         let audio = state.audio_engine.lock().map_err(|e| e.to_string())?;
         if !audio.is_recording {
-            return Ok(Vec::new());
+            return Ok(live.confirmed_segments.clone());
         }
         let buf = audio.buffer.lock().unwrap_or_else(|e| e.into_inner());
         if buf.is_empty() {
-            return Ok(Vec::new());
+            return Ok(live.confirmed_segments.clone());
         }
-        let total_dur = buf.len() as f32 / audio.sample_rate;
-        let resampled = audio::resample_to_16k(&buf, audio.sample_rate);
-        
-        let chunk_size = 16000 * 10;
-        let chunk = if resampled.len() > chunk_size {
-            resampled[resampled.len() - chunk_size..].to_vec()
+
+        let sr = audio.sample_rate;
+        let total_raw = buf.len();
+        let total_16k = (total_raw as f32 * (16000.0 / sr)).floor() as usize;
+
+        if total_16k <= offset_16k {
+            return Ok(live.confirmed_segments.clone());
+        }
+
+        // Optimized zero-copy active tail slicing & resampling
+        let ratio = sr / 16000.0;
+        let raw_start = (offset_16k as f32 * ratio).floor() as usize;
+        let raw_slice = if raw_start < total_raw {
+            &buf[raw_start..]
         } else {
-            resampled
+            &[]
         };
-        (chunk, total_dur)
+
+        if raw_slice.is_empty() {
+            return Ok(live.confirmed_segments.clone());
+        }
+
+        let resampled_tail = audio::resample_to_16k(raw_slice, sr);
+        (resampled_tail, total_16k, offset_16k)
     };
 
-    if pcm_chunk.is_empty() {
-        return Ok(Vec::new());
+    let unprocessed_len = active_pcm.len();
+    let unprocessed_duration = unprocessed_len as f32 / 16000.0;
+
+    // Only run Whisper if we have at least 1.0s of new audio
+    if unprocessed_duration < 1.0 {
+        return Ok(live.confirmed_segments.clone());
     }
 
-    let stt_guard = state.stt_engine.lock().map_err(|e| e.to_string())?;
-    if let Some(stt) = stt_guard.as_ref() {
-        let mut segs = stt.transcribe_buffer(&pcm_chunk).map_err(|e| e.to_string())?;
-        let offset = (total_duration - (pcm_chunk.len() as f32 / 16000.0)).max(0.0);
-        for s in &mut segs {
-            s.start_timestamp += offset;
-            s.end_timestamp += offset;
-        }
-        Ok(segs)
+    // Limit active inference slice to max 12 seconds to keep inference instant (<40ms)
+    let max_slice_len = 16000 * 12;
+    let (slice_to_transcribe, slice_offset_samples) = if unprocessed_len > max_slice_len {
+        let start = unprocessed_len - max_slice_len;
+        (&active_pcm[start..], slice_offset_16k + start)
     } else {
-        Ok(Vec::new())
+        (&active_pcm[..], slice_offset_16k)
+    };
+
+    let mut stt_guard = state.stt_engine.lock().map_err(|e| e.to_string())?;
+    if stt_guard.is_none() {
+        let (pref_model, pref_lang) = {
+            let conn = state.db.lock().map_err(|e| e.to_string())?;
+            let s = db::get_settings(&conn).unwrap_or_default();
+            (s.stt_model, s.stt_language)
+        };
+        let search_dirs = get_all_candidate_model_dirs();
+        if let Some(cand) = find_best_model_in_dirs(&search_dirs, Some(&pref_model), Some(&pref_lang)) {
+            *stt_guard = Some(stt::WhisperEngine::new(&cand.to_string_lossy(), &pref_lang, None));
+        }
+    }
+
+    if let Some(stt) = stt_guard.as_ref() {
+        let mut raw_segs = stt.transcribe_buffer(slice_to_transcribe).unwrap_or_default();
+        let time_base = slice_offset_samples as f32 / 16000.0;
+        let current_live_time = total_16k_samples as f32 / 16000.0;
+
+        for s in &mut raw_segs {
+            s.start_timestamp += time_base;
+            s.end_timestamp += time_base;
+            s.text = stt::deduplicate_repeated_phrases(&s.text);
+        }
+
+        raw_segs.retain(|s| !s.text.trim().is_empty());
+
+        if raw_segs.is_empty() {
+            return Ok(live.confirmed_segments.clone());
+        }
+
+        let num_segs = raw_segs.len();
+        let mut unconfirmed_segs = Vec::new();
+
+        for (idx, seg) in raw_segs.into_iter().enumerate() {
+            let is_last = idx == (num_segs - 1);
+            let time_since_end = current_live_time - seg.end_timestamp;
+
+            // Confirm segment if it's not the trailing active fragment, or if the speaker paused (>1.8s)
+            let should_confirm = !is_last || time_since_end >= 1.8;
+
+            if should_confirm {
+                let seg_end_sample = (seg.end_timestamp * 16000.0).round() as usize;
+                if seg_end_sample > live.confirmed_sample_offset {
+                    live.confirmed_sample_offset = seg_end_sample.min(total_16k_samples);
+                }
+
+                let already_present = live.confirmed_segments.last().map(|last| {
+                    let last_clean = last.text.trim().to_lowercase();
+                    let cur_clean = seg.text.trim().to_lowercase();
+                    last_clean == cur_clean || last_clean.ends_with(&cur_clean)
+                }).unwrap_or(false);
+
+                if !already_present {
+                    live.confirmed_segments.push(seg);
+                }
+            } else {
+                unconfirmed_segs.push(seg);
+            }
+        }
+
+        let mut output = live.confirmed_segments.clone();
+        for unconfirmed in unconfirmed_segs {
+            let already_present = output.last().map(|last| {
+                let last_clean = last.text.trim().to_lowercase();
+                let cur_clean = unconfirmed.text.trim().to_lowercase();
+                last_clean == cur_clean || last_clean.ends_with(&cur_clean)
+            }).unwrap_or(false);
+
+            if !already_present {
+                output.push(unconfirmed);
+            }
+        }
+
+        Ok(output)
+    } else {
+        Ok(live.confirmed_segments.clone())
     }
 }
 
@@ -132,6 +243,11 @@ async fn stop_audio_capture_and_transcribe(
     state: State<'_, AppState>,
     meeting_id: String,
 ) -> Result<Vec<TranscriptSegment>, String> {
+    if let Ok(mut live) = state.live_state.lock() {
+        live.confirmed_segments.clear();
+        live.confirmed_sample_offset = 0;
+    }
+
     let pcm_data = {
         let mut audio = state.audio_engine.lock().map_err(|e| e.to_string())?;
         audio.stop_capture()
@@ -181,7 +297,7 @@ async fn stop_audio_capture_and_transcribe(
             speaker_label: s.speaker,
             start_time: s.start_timestamp as f64,
             end_time: s.end_timestamp as f64,
-            text: s.text,
+            text: stt::deduplicate_repeated_phrases(&s.text),
             confidence: Some(0.95),
         })
         .collect();
@@ -240,7 +356,11 @@ fn transcribe_pcm_buffer(
         }
     }
     if let Some(stt) = stt_guard.as_ref() {
-        stt.transcribe_buffer(&pcm_16k).map_err(|e| e.to_string())
+        let mut segs = stt.transcribe_buffer(&pcm_16k).map_err(|e| e.to_string())?;
+        for s in &mut segs {
+            s.text = stt::deduplicate_repeated_phrases(&s.text);
+        }
+        Ok(segs)
     } else {
         Err("Whisper STT engine is not initialized. Please ensure a model is installed.".to_string())
     }
@@ -257,7 +377,11 @@ fn transcribe_file(
 
     let stt_guard = state.stt_engine.lock().map_err(|e| e.to_string())?;
     if let Some(stt) = stt_guard.as_ref() {
-        stt.transcribe_file(&file_path).map_err(|e| e.to_string())
+        let mut segs = stt.transcribe_file(&file_path).map_err(|e| e.to_string())?;
+        for s in &mut segs {
+            s.text = stt::deduplicate_repeated_phrases(&s.text);
+        }
+        Ok(segs)
     } else {
         Err("STT engine is not initialized".to_string())
     }
@@ -266,29 +390,49 @@ fn transcribe_file(
 fn consolidate_segments(segments: Vec<TranscriptSegment>) -> Vec<TranscriptSegment> {
     let mut consolidated: Vec<TranscriptSegment> = Vec::new();
     for seg in segments {
-        let text = seg.text.trim().to_string();
+        let text = stt::deduplicate_repeated_phrases(seg.text.trim());
         if text.is_empty() { continue; }
 
         if let Some(last) = consolidated.last_mut() {
-            let last_text = last.text.trim().to_string();
+            let last_text = stt::deduplicate_repeated_phrases(last.text.trim());
             let gap = seg.start_time - last.end_time;
             let same_speaker = last.speaker_label == seg.speaker_label;
 
-            if same_speaker && gap <= 5.0 && (last_text.len() + text.len()) < 600 {
+            if same_speaker && gap <= 4.0 && (last_text.len() + text.len()) < 600 {
                 let last_lower = last_text.to_lowercase();
                 let seg_lower = text.to_lowercase();
 
-                if last_lower == seg_lower {
+                if last_lower == seg_lower || last_lower.ends_with(&seg_lower) {
+                    last.end_time = last.end_time.max(seg.end_time);
                     continue;
                 }
-                if !last_lower.contains(&seg_lower) {
-                    last.text = format!("{} {}", last_text, text);
+                if last_lower.contains(&seg_lower) {
                     last.end_time = last.end_time.max(seg.end_time);
+                    continue;
                 }
+                if seg_lower.starts_with(&last_lower) {
+                    last.text = text;
+                    last.end_time = last.end_time.max(seg.end_time);
+                    continue;
+                }
+
+                // Check CJK vs Latin joining
+                let last_is_cjk = last_text.chars().last().map(|c| ('\u{4e00}'..='\u{9fff}').contains(&c) || ('\u{3040}'..='\u{30ff}').contains(&c)).unwrap_or(false);
+                let next_is_cjk = text.chars().next().map(|c| ('\u{4e00}'..='\u{9fff}').contains(&c) || ('\u{3040}'..='\u{30ff}').contains(&c)).unwrap_or(false);
+
+                if last_is_cjk && next_is_cjk {
+                    last.text = format!("{}{}", last_text, text);
+                } else {
+                    last.text = format!("{} {}", last_text, text);
+                }
+                last.end_time = last.end_time.max(seg.end_time);
+                last.text = stt::deduplicate_repeated_phrases(&last.text);
                 continue;
             }
         }
-        consolidated.push(seg);
+        let mut new_seg = seg;
+        new_seg.text = text;
+        consolidated.push(new_seg);
     }
     consolidated
 }
@@ -332,6 +476,11 @@ fn update_speaker_label(
 
 #[tauri::command]
 fn stop_recording(state: State<'_, AppState>, meeting_id: String) -> Result<Meeting, String> {
+    if let Ok(mut live) = state.live_state.lock() {
+        live.confirmed_segments.clear();
+        live.confirmed_sample_offset = 0;
+    }
+
     if let Ok(mut audio) = state.audio_engine.lock() {
         let pcm_data = audio.stop_capture();
         if !pcm_data.is_empty() {
@@ -357,7 +506,7 @@ fn stop_recording(state: State<'_, AppState>, meeting_id: String) -> Result<Meet
                                 speaker_label: s.speaker,
                                 start_time: s.start_timestamp as f64,
                                 end_time: s.end_timestamp as f64,
-                                text: s.text,
+                                text: stt::deduplicate_repeated_phrases(&s.text),
                                 confidence: Some(0.95),
                             })
                             .collect();
@@ -1067,6 +1216,7 @@ pub fn run() {
         db: Arc::new(Mutex::new(conn)),
         audio_engine: Arc::new(Mutex::new(audio::AudioEngine::new())),
         stt_engine: Arc::new(Mutex::new(stt_engine)),
+        live_state: Arc::new(Mutex::new(LiveTranscriptionState::default())),
     };
 
     tauri::Builder::default()

@@ -148,7 +148,7 @@ mod desktop {
             let rms = (pcm_float32.iter().map(|&x| x * x).sum::<f32>() / pcm_float32.len() as f32).sqrt();
             let duration = pcm_float32.len() as f32 / 16000.0;
 
-            if rms < 0.001 || duration < 0.5 {
+            if rms < 0.003 || duration < 0.5 {
                 return Ok(Vec::new());
             }
 
@@ -178,8 +178,13 @@ mod desktop {
 
             params.set_translate(false);
             params.set_n_threads(threads);
+            params.set_no_context(true);
+            params.set_single_segment(false);
             params.set_suppress_blank(true);
             params.set_suppress_nst(true);
+            params.set_no_speech_thold(0.6);
+            params.set_logprob_thold(-1.0);
+            params.set_entropy_thold(2.4);
             params.set_print_special(false);
             params.set_print_progress(false);
             params.set_print_realtime(false);
@@ -206,8 +211,13 @@ mod desktop {
                     }
                     retry_params.set_translate(false);
                     retry_params.set_n_threads(threads);
+                    retry_params.set_no_context(true);
+                    retry_params.set_single_segment(false);
                     retry_params.set_suppress_blank(true);
                     retry_params.set_suppress_nst(true);
+                    retry_params.set_no_speech_thold(0.6);
+                    retry_params.set_logprob_thold(-1.0);
+                    retry_params.set_entropy_thold(2.4);
                     retry_params.set_print_special(false);
                     retry_params.set_print_progress(false);
                     retry_params.set_print_realtime(false);
@@ -246,12 +256,13 @@ mod desktop {
                                      .trim()
                                      .to_string();
 
-                if clean_text.is_empty() { continue; }
+                let deduped = deduplicate_repeated_phrases(&clean_text);
+                if deduped.is_empty() { continue; }
 
                 segments.push(WhisperSegment {
                     start_timestamp: seg.start_timestamp() as f32 / 100.0,
                     end_timestamp: seg.end_timestamp() as f32 / 100.0,
-                    text: clean_text,
+                    text: deduped,
                     speaker: "Speaker".to_string(),
                 });
             }
@@ -267,5 +278,90 @@ mod desktop {
             let pcm = crate::audio::read_wav_to_16k_pcm(path)?;
             self.transcribe_buffer(&pcm)
         }
+    }
+
+    /// Removes consecutive repeated phrases and n-grams common in speech recognition hallucinations (especially Chinese/CJK and English).
+    pub fn deduplicate_repeated_phrases(input: &str) -> String {
+        let mut text = input.trim().to_string();
+        if text.is_empty() {
+            return text;
+        }
+
+        // 1. Character-level repeating pattern detection (handles Chinese without spaces or with spaces)
+        let chars: Vec<char> = text.chars().collect();
+        let n = chars.len();
+        if n >= 4 {
+            for pat_len in (2..=(n / 2)).rev() {
+                let mut i = 0;
+                let mut result_chars: Vec<char> = Vec::with_capacity(n);
+                let mut modified = false;
+
+                while i < chars.len() {
+                    if i + 2 * pat_len <= chars.len() {
+                        let pat1 = &chars[i..i + pat_len];
+                        let pat2 = &chars[i + pat_len..i + 2 * pat_len];
+
+                        if pat1 == pat2 {
+                            result_chars.extend_from_slice(pat1);
+                            i += 2 * pat_len;
+                            while i + pat_len <= chars.len() && &chars[i..i + pat_len] == pat1 {
+                                i += pat_len;
+                            }
+                            modified = true;
+                            continue;
+                        }
+                    }
+                    result_chars.push(chars[i]);
+                    i += 1;
+                }
+
+                if modified {
+                    text = result_chars.into_iter().collect::<String>().trim().to_string();
+                    break;
+                }
+            }
+        }
+
+        // 2. Word-level repeating n-gram detection (handles space-separated words / phrases)
+        let words: Vec<&str> = text.split_whitespace().collect();
+        if words.len() >= 2 {
+            for ngram_len in (1..=(words.len() / 2)).rev() {
+                let mut i = 0;
+                let mut new_words = Vec::new();
+                let mut modified = false;
+
+                while i < words.len() {
+                    if i + 2 * ngram_len <= words.len() {
+                        let chunk1 = &words[i..i + ngram_len];
+                        let chunk2 = &words[i + ngram_len..i + 2 * ngram_len];
+
+                        if chunk1 == chunk2 {
+                            new_words.extend_from_slice(chunk1);
+                            i += 2 * ngram_len;
+                            while i + ngram_len <= words.len() && &words[i..i + ngram_len] == chunk1 {
+                                i += ngram_len;
+                            }
+                            modified = true;
+                            continue;
+                        }
+                    }
+                    new_words.push(words[i]);
+                    i += 1;
+                }
+
+                if modified {
+                    // Check if original words were mostly CJK (join without space) or Latin (join with space)
+                    let is_mostly_cjk = text.chars().filter(|c| ('\u{4e00}'..='\u{9fff}').contains(c)).count() > text.chars().filter(|c| c.is_alphabetic()).count() / 2;
+                    if is_mostly_cjk {
+                        text = new_words.join("");
+                    } else {
+                        text = new_words.join(" ");
+                    }
+                    break;
+                }
+            }
+        }
+
+        text
     }
 }
